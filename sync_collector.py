@@ -334,6 +334,28 @@ def main():
             )
         log.info("Inserted %d snapshots", len(snapshots))
 
+        # 6b. Compact old snapshots (same 14-day tiered retention as local)
+        cutoff = now_ts - 14 * 86400
+        db.execute(
+            """
+            DELETE FROM cloud_snapshots
+            WHERE fetched_at < ?
+              AND rowid NOT IN (
+                SELECT rowid FROM (
+                  SELECT rowid,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY video_id, fetched_at / 86400
+                           ORDER BY fetched_at DESC
+                         ) AS rn
+                  FROM cloud_snapshots
+                  WHERE fetched_at < ?
+                ) WHERE rn = 1
+              )
+            """,
+            (cutoff, cutoff),
+        )
+        log.info("Retention compacted cloud_snapshots older than %d", cutoff)
+
         # 7. Update last_sync
         db.execute("UPDATE cloud_sync_state SET value = ? WHERE key = 'last_sync'", (str(now_ts),))
         log.info("Updated last_sync = %d", now_ts)
