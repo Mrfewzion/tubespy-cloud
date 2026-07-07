@@ -37,4 +37,7 @@ CREATE TABLE IF NOT EXISTS cloud_sync_state (
     value TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_cloud_videos_first_seen ON cloud_videos(first_seen_at);
+CREATE INDEX IF NOT EXISTS idx_cloud_snapshots_fetched ON cloud_snapshots(fetched_at);
+
 INSERT OR IGNORE INTO cloud_sync_state (key, value) VALUES ('last_sync', '0');
