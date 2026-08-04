@@ -29,6 +29,12 @@ TURSO_URL = os.environ["TURSO_DB_URL"]
 TURSO_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
 YOUTUBE_KEY = os.environ["YOUTUBE_API_KEY"]
 
+# ── HTTP tuning (env-overridable) ────────────────────────────────────
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "5"))
+HTTP_BACKOFF_BASE = float(os.getenv("HTTP_BACKOFF_BASE", "1"))
+HTTP_MAX_BACKOFF = float(os.getenv("HTTP_MAX_BACKOFF", "30"))
+
 RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 
 # Walk at most 2 pages (50 each) per channel per run — catches ~100 latest uploads
@@ -84,7 +90,7 @@ class _TursoClient:
     """Wraps Turso HTTP /v2/pipeline to look like libsql_client's execute()."""
 
     def __init__(self, url: str, token: str):
-        self._http = httpx.Client(http2=True, timeout=15.0)
+        self._http = httpx.Client(http2=True, timeout=HTTP_TIMEOUT)
         self._base = _turso_http_url(url) + "/v2/pipeline"
         self._http.headers["Authorization"] = f"Bearer {token}"
 
@@ -92,16 +98,42 @@ class _TursoClient:
         req = {"type": "execute", "stmt": {"sql": sql}}
         if args is not None:
             req["stmt"]["args"] = [_typed(a) for a in args]
-        resp = self._http.post(self._base, json={"requests": [req]})
+        results = self._run_pipeline([req])
+        return results[0] if results else []
+
+    def execute_batch(self, statements):
+        """Send many statements in /v2/pipeline chunks (500 max) — one round trip each.
+
+        statements: iterable of (sql, args|None) tuples.
+        Returns one row-list per statement, in order.
+        """
+        results = []
+        chunk = []
+        for sql, args in statements:
+            req = {"type": "execute", "stmt": {"sql": sql}}
+            if args is not None:
+                req["stmt"]["args"] = [_typed(a) for a in args]
+            chunk.append(req)
+            if len(chunk) >= 500:
+                results.extend(self._run_pipeline(chunk))
+                chunk = []
+        if chunk:
+            results.extend(self._run_pipeline(chunk))
+        return results
+
+    def _run_pipeline(self, requests):
+        resp = _request_with_retries(self._http, "POST", self._base, json={"requests": requests})
         resp.raise_for_status()
         data = resp.json()
-        result = data["results"][0]
-        if result["type"] == "error":
-            msg = result.get("error", {}).get("message", str(result))
-            raise RuntimeError(f"Turso error: {msg}")
-        result = result["response"]["result"]
-        cols = result["cols"]
-        return [_TursoRow([_untyped(c) for c in row]) for row in result["rows"]]
+        out = []
+        for result in data.get("results", []):
+            if result["type"] == "error":
+                msg = result.get("error", {}).get("message", str(result))
+                raise RuntimeError(f"Turso error: {msg}")
+            r = result["response"]["result"]
+            cols = r["cols"]
+            out.append([_TursoRow([_untyped(c) for c in row]) for row in r["rows"]])
+        return out
 
     def close(self):
         self._http.close()
@@ -120,8 +152,25 @@ def _parse_duration(iso: str | None) -> int | None:
 
 
 # ── HTTP ───────────────────────────────────────────────────────────────
+def _request_with_retries(client, method, url, **kwargs):
+    """Send an httpx request, retrying timeouts/transport errors with backoff."""
+    for attempt in range(1, HTTP_RETRIES + 1):
+        try:
+            return client.request(method, url, **kwargs)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            if attempt >= HTTP_RETRIES:
+                log.error("Request %s %s failed after %d attempts: %s", method, url, HTTP_RETRIES, e)
+                raise
+            backoff = min(HTTP_BACKOFF_BASE * (2 ** (attempt - 1)), HTTP_MAX_BACKOFF)
+            log.warning(
+                "Request %s %s timed out (attempt %d/%d): %s — retrying in %.1fs",
+                method, url, attempt, HTTP_RETRIES, e, backoff,
+            )
+            time.sleep(backoff)
+
+
 def _http():
-    return httpx.Client(http2=True, timeout=15.0)
+    return httpx.Client(http2=True, timeout=HTTP_TIMEOUT)
 
 
 # ── YouTube API helpers ───────────────────────────────────────────────
@@ -140,8 +189,8 @@ def discover_uploads(http, channel_id, uploads_playlist_id, known_ids):
         }
         if page_token:
             params["pageToken"] = page_token
-        resp = http.get(
-            "https://www.googleapis.com/youtube/v3/playlistItems",
+        resp = _request_with_retries(
+            http, "GET", "https://www.googleapis.com/youtube/v3/playlistItems",
             params=params,
         )
         if resp.status_code == 403:
@@ -171,7 +220,7 @@ def discover_uploads(http, channel_id, uploads_playlist_id, known_ids):
 def discover_rss(http, channel_id):
     """Fallback RSS discovery (0 quota, latest ~15)."""
     try:
-        resp = http.get(RSS_URL.format(channel_id=channel_id), follow_redirects=True)
+        resp = _request_with_retries(http, "GET", RSS_URL.format(channel_id=channel_id), follow_redirects=True)
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
         ids = []
@@ -195,8 +244,8 @@ def snapshot_videos(http, video_ids):
     now = int(time.time())
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i : i + 50]
-        resp = http.get(
-            "https://www.googleapis.com/youtube/v3/videos",
+        resp = _request_with_retries(
+            http, "GET", "https://www.googleapis.com/youtube/v3/videos",
             params={
                 "part": "snippet,contentDetails,statistics",
                 "id": ",".join(batch),
@@ -276,22 +325,21 @@ def main():
                 for vid in rss_extra:
                     discovered_pairs.append((vid, cid))
 
-        # 4. Insert new videos into Turso
+        # 4. Insert new videos into Turso (batched)
         now_ts = int(time.time())
-        for vid, cid in discovered_pairs:
-            db.execute(
-                "INSERT OR IGNORE INTO cloud_videos (video_id, channel_id, first_seen_at) VALUES (?, ?, ?)",
-                (vid, cid, now_ts),
-            )
         if discovered_pairs:
+            db.execute_batch(
+                ("INSERT OR IGNORE INTO cloud_videos (video_id, channel_id, first_seen_at) VALUES (?, ?, ?)", (vid, cid, now_ts))
+                for vid, cid in discovered_pairs
+            )
             log.info("Inserted %d new video records", len(discovered_pairs))
 
         # 4b. Load published_at for newly discovered videos from playlistItems
         if discovered_pairs:
             for i in range(0, len(discovered_pairs), 50):
                 batch = [v for v, _ in discovered_pairs[i:i+50]]
-                resp = http.get(
-                    "https://www.googleapis.com/youtube/v3/videos",
+                resp = _request_with_retries(
+                    http, "GET", "https://www.googleapis.com/youtube/v3/videos",
                     params={
                         "part": "snippet",
                         "id": ",".join(batch),
@@ -302,14 +350,17 @@ def main():
                 )
                 if resp.status_code != 200:
                     continue
+                pub_stmts = []
                 for item in resp.json().get("items", []):
                     pub = item.get("snippet", {}).get("publishedAt")
                     if pub:
                         pub_ts = int(calendar.timegm(time.strptime(pub.replace("Z", "").replace("z", ""), "%Y-%m-%dT%H:%M:%S")))
-                        db.execute(
+                        pub_stmts.append((
                             "UPDATE cloud_videos SET published_at = ? WHERE video_id = ? AND published_at IS NULL",
                             (pub_ts, item["id"]),
-                        )
+                        ))
+                if pub_stmts:
+                    db.execute_batch(pub_stmts)
 
         # 5. Snapshot all known videos
         all_video_ids = [r[0] for r in db.execute("SELECT video_id FROM cloud_videos")]
@@ -318,20 +369,28 @@ def main():
         snapshots = snapshot_videos(http, all_video_ids)
         log.info("Got %d snapshot records", len(snapshots))
 
-        # 5b. Update video metadata from snapshot response
-        for s in snapshots:
-            if s["title"]:
-                db.execute(
-                    "UPDATE cloud_videos SET title = ?, description = ?, tags = ?, category_id = ?, duration_seconds = ?, published_at = COALESCE(published_at, ?), thumbnail_url = ? WHERE video_id = ?",
-                    (s["title"], s["description"], s["tags"], s["category_id"], s["duration_seconds"], s["published_at"], s["thumbnail_url"], s["video_id"]),
-                )
+        # 5b. Update video metadata from snapshot response (batched)
+        meta_stmts = [
+            (
+                "UPDATE cloud_videos SET title = ?, description = ?, tags = ?, category_id = ?, duration_seconds = ?, published_at = COALESCE(published_at, ?), thumbnail_url = ? WHERE video_id = ?",
+                (s["title"], s["description"], s["tags"], s["category_id"], s["duration_seconds"], s["published_at"], s["thumbnail_url"], s["video_id"]),
+            )
+            for s in snapshots
+            if s["title"]
+        ]
+        if meta_stmts:
+            db.execute_batch(meta_stmts)
 
-        # 6. Insert snapshots into Turso
-        for s in snapshots:
-            db.execute(
+        # 6. Insert snapshots into Turso (batched)
+        snap_stmts = [
+            (
                 "INSERT OR IGNORE INTO cloud_snapshots (video_id, fetched_at, view_count, like_count, comment_count) VALUES (?, ?, ?, ?, ?)",
                 (s["video_id"], s["fetched_at"], s["view_count"], s["like_count"], s["comment_count"]),
             )
+            for s in snapshots
+        ]
+        if snap_stmts:
+            db.execute_batch(snap_stmts)
         log.info("Inserted %d snapshots", len(snapshots))
 
         # 6b. Compact old snapshots (same 14-day tiered retention as local)
