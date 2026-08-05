@@ -153,20 +153,45 @@ def _parse_duration(iso: str | None) -> int | None:
 
 # ── HTTP ───────────────────────────────────────────────────────────────
 def _request_with_retries(client, method, url, **kwargs):
-    """Send an httpx request, retrying timeouts/transport errors with backoff."""
+    """Send an httpx request, retrying timeouts/transport errors and transient
+    HTTP statuses (429, 5xx) with exponential backoff.
+
+    Safe to retry because every call here is idempotent: YouTube GETs, and
+    Turso writes that are all INSERT OR IGNORE / UPDATE / DELETE. The final
+    response is always returned (never raised) so callers can inspect
+    status_code (e.g. the 403 quota checks in discover_uploads/snapshot_videos).
+    """
     for attempt in range(1, HTTP_RETRIES + 1):
         try:
-            return client.request(method, url, **kwargs)
+            resp = client.request(method, url, **kwargs)
         except (httpx.TimeoutException, httpx.TransportError) as e:
             if attempt >= HTTP_RETRIES:
                 log.error("Request %s %s failed after %d attempts: %s", method, url, HTTP_RETRIES, e)
                 raise
             backoff = min(HTTP_BACKOFF_BASE * (2 ** (attempt - 1)), HTTP_MAX_BACKOFF)
             log.warning(
-                "Request %s %s timed out (attempt %d/%d): %s — retrying in %.1fs",
+                "Request %s %s timed out (attempt %d/%d): %s - retrying in %.1fs",
                 method, url, attempt, HTTP_RETRIES, e, backoff,
             )
             time.sleep(backoff)
+            continue
+
+        if resp.status_code >= 500 or resp.status_code == 429:
+            if attempt >= HTTP_RETRIES:
+                log.error(
+                    "Request %s %s returned %d after %d attempts - giving up",
+                    method, url, resp.status_code, HTTP_RETRIES,
+                )
+                return resp  # caller decides (raise_for_status, quota checks)
+            backoff = min(HTTP_BACKOFF_BASE * (2 ** (attempt - 1)), HTTP_MAX_BACKOFF)
+            log.warning(
+                "Request %s %s returned %d (attempt %d/%d) - retrying in %.1fs",
+                method, url, resp.status_code, attempt, HTTP_RETRIES, backoff,
+            )
+            time.sleep(backoff)
+            continue
+
+        return resp
 
 
 def _http():
