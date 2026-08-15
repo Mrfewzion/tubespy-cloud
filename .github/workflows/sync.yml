@@ -1,9 +1,13 @@
-name: Sync YouTube Stats
+name: Sync YouTube Stats (R2)
 
 on:
   schedule:
     - cron: '0 */2 * * *'
   workflow_dispatch:
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -15,12 +19,55 @@ jobs:
           python-version: '3.13'
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Download cloud.db (abort if download fails)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          if aws s3 ls "s3://${AWS_BUCKET}/cloud.db" --endpoint-url "${AWS_ENDPOINT_URL}" >/dev/null 2>&1; then
+            aws s3 cp "s3://${AWS_BUCKET}/cloud.db" ./cloud.db --endpoint-url "${AWS_ENDPOINT_URL}"
+          else
+            echo "No cloud.db yet — starting fresh"
+          fi
+
+      - name: Download app sidecars (may not exist yet)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          aws s3 cp "s3://${AWS_BUCKET}/channels.json" ./channels.json --endpoint-url "${AWS_ENDPOINT_URL}" || true
+          aws s3 cp "s3://${AWS_BUCKET}/catalog.json" ./catalog.json --endpoint-url "${AWS_ENDPOINT_URL}" || true
+
       - name: Run collector
         run: python sync_collector.py
         env:
-          TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
-          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           HTTP_TIMEOUT_SECONDS: '60'
           HTTP_RETRIES: '5'
           HTTP_BACKOFF_BASE: '1'
+
+      - name: Verify integrity before upload
+        run: |
+          python -c "import sqlite3; c=sqlite3.connect('cloud.db'); assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok', 'integrity check failed'"
+
+      - name: Upload cloud.db (atomic temp key + copy)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          TS=$(date +%s)
+          aws s3 cp ./cloud.db "s3://${AWS_BUCKET}/cloud.db.tmp-${TS}" --endpoint-url "${AWS_ENDPOINT_URL}"
+          aws s3api copy-object \
+            --bucket "${AWS_BUCKET}" \
+            --copy-source "${AWS_BUCKET}/cloud.db.tmp-${TS}" \
+            --key cloud.db \
+            --endpoint-url "${AWS_ENDPOINT_URL}"
+          aws s3 rm "s3://${AWS_BUCKET}/cloud.db.tmp-${TS}" --endpoint-url "${AWS_ENDPOINT_URL}"
+          echo "cloud.db updated"

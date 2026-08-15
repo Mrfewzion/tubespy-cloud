@@ -1,19 +1,26 @@
-"""Zero-maintenance YouTube stats collector for Turso.
+"""Zero-maintenance YouTube stats collector for R2-hosted cloud.db.
 
 Run via GitHub Actions every 2 hours:
-  1. Read tracked channels from Turso
-  2. Walk each channel's uploads playlist (newest only, stop at known)
-  3. Supplement with RSS (catches API gaps)
-  4. Snapshot all known videos' stats (videos.list, batched 50)
-  5. Store results in Turso
+  1. Apply schema to the downloaded cloud.db (sqlite file, stdlib driver)
+  2. Merge app sidecars (channels.json, catalog.json) — INSERT OR IGNORE
+  3. Walk each channel's uploads playlist (newest only, stop at known)
+  4. Supplement with RSS (catches API gaps)
+  5. Snapshot all known videos' stats (videos.list, batched 50)
+  6. Compact old snapshots (14-day tiered retention)
+  7. Update last_sync
+
+The workflow uploads the file back to R2 atomically (temp key + copy).
 """
 
 import calendar
+import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import logging
+from pathlib import Path
 
 import httpx
 import feedparser
@@ -25,9 +32,9 @@ logging.basicConfig(
 log = logging.getLogger("sync")
 
 # ── Config from environment ──────────────────────────────────────────
-TURSO_URL = os.environ["TURSO_DB_URL"]
-TURSO_TOKEN = os.environ["TURSO_AUTH_TOKEN"]
 YOUTUBE_KEY = os.environ["YOUTUBE_API_KEY"]
+CLOUD_DB_PATH = Path(os.getenv("CLOUD_DB_PATH", "cloud.db"))
+SCHEMA_PATH = Path(os.getenv("SCHEMA_PATH", str(Path(__file__).parent / "schema.sql")))
 
 # ── HTTP tuning (env-overridable) ────────────────────────────────────
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "30"))
@@ -40,103 +47,90 @@ RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 # Walk at most 2 pages (50 each) per channel per run — catches ~100 latest uploads
 MAX_PLAYLIST_PAGES = 2
 
-# ── Turso HTTP client (replaces libsql-client / Hrana WebSocket) ──────
-def _turso_http_url(libsql_url: str) -> str:
-    return libsql_url.replace("libsql://", "https://", 1)
+
+# ── SQLite ────────────────────────────────────────────────────────────
+def _connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
-def _typed(value):
-    """Convert a Python value to a Turso typed arg."""
-    if value is None:
-        return {"type": "null"}
-    if isinstance(value, bool):
-        return {"type": "integer", "value": "1" if value else "0"}
-    if isinstance(value, int):
-        return {"type": "integer", "value": str(value)}
-    if isinstance(value, float):
-        return {"type": "float", "value": str(value)}
-    return {"type": "text", "value": str(value)}
+def _apply_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA_PATH.read_text("utf-8"))
+    conn.commit()
 
 
-def _untyped(value: dict):
-    """Convert a Turso typed value back to a Python value."""
-    t = value["type"]
-    if t == "null":
-        return None
-    if t == "integer":
-        return int(value["value"])
-    if t == "float":
-        return float(value["value"])
-    return value["value"]
+def _merge_sidecars(conn: sqlite3.Connection) -> dict:
+    """Merge app-uploaded channels.json / catalog.json into the cloud DB.
 
+    Returns {"channels": N, "videos": N, "snapshots": N} merged.
+    """
+    counts = {"channels": 0, "videos": 0, "snapshots": 0}
 
-class _TursoRow:
-    """Minimal tuple-like row wrapper for backward compat with r[0] access."""
+    channels_path = Path("channels.json")
+    if channels_path.exists():
+        try:
+            channels = json.loads(channels_path.read_text("utf-8"))
+            rows = [
+                (c["channel_id"], c.get("name", ""), c.get("handle"),
+                 c.get("uploads_playlist_id"), int(c.get("added_at", 0)))
+                for c in channels
+            ]
+            conn.executemany(
+                "INSERT OR IGNORE INTO cloud_channels"
+                " (channel_id, name, handle, uploads_playlist_id, added_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+            counts["channels"] = len(rows)
+            log.info("Merged %d channels from channels.json", len(rows))
+        except Exception:
+            log.warning("Failed to merge channels.json", exc_info=True)
 
-    def __init__(self, values: list):
-        self._values = values
+    catalog_path = Path("catalog.json")
+    if catalog_path.exists():
+        try:
+            catalog = json.loads(catalog_path.read_text("utf-8"))
+            video_rows = []
+            snap_rows = []
+            for entry in catalog:
+                cid = entry["channel_id"]
+                for v in entry.get("videos", []):
+                    # videos list: video_id, channel_id, title, description, tags,
+                    # category_id, published_at, duration_seconds, thumbnail_url,
+                    # first_seen_at
+                    video_rows.append(
+                        (v[0], cid, v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9])
+                    )
+                for s in entry.get("snapshots", []):
+                    # snapshots list: video_id, fetched_at, view_count,
+                    # like_count, comment_count
+                    snap_rows.append(tuple(s))
+            if video_rows:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO cloud_videos (video_id, channel_id, title,"
+                    " description, tags, category_id, published_at, duration_seconds,"
+                    " thumbnail_url, first_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    video_rows,
+                )
+                counts["videos"] = len(video_rows)
+            if snap_rows:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO cloud_snapshots (video_id, fetched_at,"
+                    " view_count, like_count, comment_count) VALUES (?, ?, ?, ?, ?)",
+                    snap_rows,
+                )
+                counts["snapshots"] = len(snap_rows)
+            conn.commit()
+            log.info(
+                "Merged %d videos, %d snapshots from catalog.json",
+                counts["videos"], counts["snapshots"],
+            )
+        except Exception:
+            log.warning("Failed to merge catalog.json", exc_info=True)
 
-    def __getitem__(self, i):
-        return self._values[i]
-
-    def __iter__(self):
-        return iter(self._values)
-
-    def __len__(self):
-        return len(self._values)
-
-
-class _TursoClient:
-    """Wraps Turso HTTP /v2/pipeline to look like libsql_client's execute()."""
-
-    def __init__(self, url: str, token: str):
-        self._http = httpx.Client(http2=True, timeout=HTTP_TIMEOUT)
-        self._base = _turso_http_url(url) + "/v2/pipeline"
-        self._http.headers["Authorization"] = f"Bearer {token}"
-
-    def execute(self, sql: str, args: tuple | list | None = None):
-        req = {"type": "execute", "stmt": {"sql": sql}}
-        if args is not None:
-            req["stmt"]["args"] = [_typed(a) for a in args]
-        results = self._run_pipeline([req])
-        return results[0] if results else []
-
-    def execute_batch(self, statements):
-        """Send many statements in /v2/pipeline chunks (500 max) — one round trip each.
-
-        statements: iterable of (sql, args|None) tuples.
-        Returns one row-list per statement, in order.
-        """
-        results = []
-        chunk = []
-        for sql, args in statements:
-            req = {"type": "execute", "stmt": {"sql": sql}}
-            if args is not None:
-                req["stmt"]["args"] = [_typed(a) for a in args]
-            chunk.append(req)
-            if len(chunk) >= 500:
-                results.extend(self._run_pipeline(chunk))
-                chunk = []
-        if chunk:
-            results.extend(self._run_pipeline(chunk))
-        return results
-
-    def _run_pipeline(self, requests):
-        resp = _request_with_retries(self._http, "POST", self._base, json={"requests": requests})
-        resp.raise_for_status()
-        data = resp.json()
-        out = []
-        for result in data.get("results", []):
-            if result["type"] == "error":
-                msg = result.get("error", {}).get("message", str(result))
-                raise RuntimeError(f"Turso error: {msg}")
-            r = result["response"]["result"]
-            cols = r["cols"]
-            out.append([_TursoRow([_untyped(c) for c in row]) for row in r["rows"]])
-        return out
-
-    def close(self):
-        self._http.close()
+    return counts
 
 
 # ── Parsing helpers ─────────────────────────────────────────────────────
@@ -153,45 +147,20 @@ def _parse_duration(iso: str | None) -> int | None:
 
 # ── HTTP ───────────────────────────────────────────────────────────────
 def _request_with_retries(client, method, url, **kwargs):
-    """Send an httpx request, retrying timeouts/transport errors and transient
-    HTTP statuses (429, 5xx) with exponential backoff.
-
-    Safe to retry because every call here is idempotent: YouTube GETs, and
-    Turso writes that are all INSERT OR IGNORE / UPDATE / DELETE. The final
-    response is always returned (never raised) so callers can inspect
-    status_code (e.g. the 403 quota checks in discover_uploads/snapshot_videos).
-    """
+    """Send an httpx request, retrying timeouts/transport errors with backoff."""
     for attempt in range(1, HTTP_RETRIES + 1):
         try:
-            resp = client.request(method, url, **kwargs)
+            return client.request(method, url, **kwargs)
         except (httpx.TimeoutException, httpx.TransportError) as e:
             if attempt >= HTTP_RETRIES:
                 log.error("Request %s %s failed after %d attempts: %s", method, url, HTTP_RETRIES, e)
                 raise
             backoff = min(HTTP_BACKOFF_BASE * (2 ** (attempt - 1)), HTTP_MAX_BACKOFF)
             log.warning(
-                "Request %s %s timed out (attempt %d/%d): %s - retrying in %.1fs",
+                "Request %s %s timed out (attempt %d/%d): %s — retrying in %.1fs",
                 method, url, attempt, HTTP_RETRIES, e, backoff,
             )
             time.sleep(backoff)
-            continue
-
-        if resp.status_code >= 500 or resp.status_code == 429:
-            if attempt >= HTTP_RETRIES:
-                log.error(
-                    "Request %s %s returned %d after %d attempts - giving up",
-                    method, url, resp.status_code, HTTP_RETRIES,
-                )
-                return resp  # caller decides (raise_for_status, quota checks)
-            backoff = min(HTTP_BACKOFF_BASE * (2 ** (attempt - 1)), HTTP_MAX_BACKOFF)
-            log.warning(
-                "Request %s %s returned %d (attempt %d/%d) - retrying in %.1fs",
-                method, url, resp.status_code, attempt, HTTP_RETRIES, backoff,
-            )
-            time.sleep(backoff)
-            continue
-
-        return resp
 
 
 def _http():
@@ -312,19 +281,28 @@ def snapshot_videos(http, video_ids):
 # ── Main ──────────────────────────────────────────────────────────────
 def main():
     _t0 = time.perf_counter()
-    log.info("Collector starting")
+    log.info("Collector starting (cloud.db=%s)", CLOUD_DB_PATH)
 
     http = _http()
-    db = _TursoClient(TURSO_URL, TURSO_TOKEN)
+    conn = _connect(CLOUD_DB_PATH)
 
     try:
-        # 1. Load tracked channels from Turso
-        rows = db.execute("SELECT channel_id, name, handle, uploads_playlist_id FROM cloud_channels")
-        channels = [{"channel_id": r[0], "name": r[1], "handle": r[2], "uploads_playlist_id": r[3]} for r in rows]
+        # 0. Schema + app sidecars
+        _apply_schema(conn)
+        merged = _merge_sidecars(conn)
+
+        # 1. Load tracked channels
+        rows = conn.execute(
+            "SELECT channel_id, name, handle, uploads_playlist_id FROM cloud_channels"
+        ).fetchall()
+        channels = [
+            {"channel_id": r[0], "name": r[1], "handle": r[2], "uploads_playlist_id": r[3]}
+            for r in rows
+        ]
         log.info("Loaded %d tracked channels", len(channels))
 
         # 2. Load known video IDs (for stop-at-known during discovery)
-        known_ids = {r[0] for r in db.execute("SELECT video_id FROM cloud_videos")}
+        known_ids = {r[0] for r in conn.execute("SELECT video_id FROM cloud_videos")}
         log.info("Known video IDs: %d", len(known_ids))
 
         # 3. Discover new uploads per channel — track (video_id, channel_id) pairs
@@ -350,13 +328,15 @@ def main():
                 for vid in rss_extra:
                     discovered_pairs.append((vid, cid))
 
-        # 4. Insert new videos into Turso (batched)
+        # 4. Insert new videos (batched)
         now_ts = int(time.time())
         if discovered_pairs:
-            db.execute_batch(
-                ("INSERT OR IGNORE INTO cloud_videos (video_id, channel_id, first_seen_at) VALUES (?, ?, ?)", (vid, cid, now_ts))
-                for vid, cid in discovered_pairs
+            conn.executemany(
+                "INSERT OR IGNORE INTO cloud_videos (video_id, channel_id, first_seen_at)"
+                " VALUES (?, ?, ?)",
+                [(vid, cid, now_ts) for vid, cid in discovered_pairs],
             )
+            conn.commit()
             log.info("Inserted %d new video records", len(discovered_pairs))
 
         # 4b. Load published_at for newly discovered videos from playlistItems
@@ -380,15 +360,19 @@ def main():
                     pub = item.get("snippet", {}).get("publishedAt")
                     if pub:
                         pub_ts = int(calendar.timegm(time.strptime(pub.replace("Z", "").replace("z", ""), "%Y-%m-%dT%H:%M:%S")))
-                        pub_stmts.append((
-                            "UPDATE cloud_videos SET published_at = ? WHERE video_id = ? AND published_at IS NULL",
-                            (pub_ts, item["id"]),
-                        ))
+                        pub_stmts.append(
+                            (pub_ts, item["id"])
+                        )
                 if pub_stmts:
-                    db.execute_batch(pub_stmts)
+                    conn.executemany(
+                        "UPDATE cloud_videos SET published_at = ?"
+                        " WHERE video_id = ? AND published_at IS NULL",
+                        pub_stmts,
+                    )
+                    conn.commit()
 
         # 5. Snapshot all known videos
-        all_video_ids = [r[0] for r in db.execute("SELECT video_id FROM cloud_videos")]
+        all_video_ids = [r[0] for r in conn.execute("SELECT video_id FROM cloud_videos")]
         log.info("Snapshotting %d videos", len(all_video_ids))
 
         snapshots = snapshot_videos(http, all_video_ids)
@@ -397,30 +381,40 @@ def main():
         # 5b. Update video metadata from snapshot response (batched)
         meta_stmts = [
             (
-                "UPDATE cloud_videos SET title = ?, description = ?, tags = ?, category_id = ?, duration_seconds = ?, published_at = COALESCE(published_at, ?), thumbnail_url = ? WHERE video_id = ?",
-                (s["title"], s["description"], s["tags"], s["category_id"], s["duration_seconds"], s["published_at"], s["thumbnail_url"], s["video_id"]),
+                s["title"], s["description"], s["tags"], s["category_id"],
+                s["duration_seconds"], s["published_at"], s["thumbnail_url"],
+                s["video_id"],
             )
             for s in snapshots
             if s["title"]
         ]
         if meta_stmts:
-            db.execute_batch(meta_stmts)
-
-        # 6. Insert snapshots into Turso (batched)
-        snap_stmts = [
-            (
-                "INSERT OR IGNORE INTO cloud_snapshots (video_id, fetched_at, view_count, like_count, comment_count) VALUES (?, ?, ?, ?, ?)",
-                (s["video_id"], s["fetched_at"], s["view_count"], s["like_count"], s["comment_count"]),
+            conn.executemany(
+                "UPDATE cloud_videos SET title = ?, description = ?, tags = ?,"
+                " category_id = ?, duration_seconds = ?,"
+                " published_at = COALESCE(published_at, ?), thumbnail_url = ?"
+                " WHERE video_id = ?",
+                meta_stmts,
             )
+            conn.commit()
+
+        # 6. Insert snapshots (batched)
+        snap_stmts = [
+            (s["video_id"], s["fetched_at"], s["view_count"], s["like_count"], s["comment_count"])
             for s in snapshots
         ]
         if snap_stmts:
-            db.execute_batch(snap_stmts)
+            conn.executemany(
+                "INSERT OR IGNORE INTO cloud_snapshots (video_id, fetched_at,"
+                " view_count, like_count, comment_count) VALUES (?, ?, ?, ?, ?)",
+                snap_stmts,
+            )
+            conn.commit()
         log.info("Inserted %d snapshots", len(snapshots))
 
         # 6b. Compact old snapshots (same 14-day tiered retention as local)
         cutoff = now_ts - 14 * 86400
-        db.execute(
+        conn.execute(
             """
             DELETE FROM cloud_snapshots
             WHERE fetched_at < ?
@@ -438,20 +432,36 @@ def main():
             """,
             (cutoff, cutoff),
         )
+        conn.commit()
         log.info("Retention compacted cloud_snapshots older than %d", cutoff)
 
         # 7. Update last_sync
-        db.execute("UPDATE cloud_sync_state SET value = ? WHERE key = 'last_sync'", (str(now_ts),))
+        conn.execute(
+            "UPDATE cloud_sync_state SET value = ? WHERE key = 'last_sync'",
+            (str(now_ts),),
+        )
+        conn.commit()
         log.info("Updated last_sync = %d", now_ts)
 
+        # 8. Integrity check before the workflow uploads the file
+        check = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if check != "ok":
+            raise RuntimeError(f"integrity_check failed: {check}")
+        log.info("integrity_check: ok")
+
         elapsed = time.perf_counter() - _t0
-        log.info("Collector done in %.2fs — %d new videos, %d snapshots", elapsed, len(discovered_pairs), len(snapshots))
+        log.info(
+            "Collector done in %.2fs — %d new videos, %d snapshots (merged: %d channels, %d videos, %d snapshots)",
+            elapsed, len(discovered_pairs), len(snapshots),
+            merged["channels"], merged["videos"], merged["snapshots"],
+        )
 
     except Exception:
         log.exception("Collector failed")
         sys.exit(1)
     finally:
-        db.close()
+        conn.close()
+        http.close()
 
 
 if __name__ == "__main__":
