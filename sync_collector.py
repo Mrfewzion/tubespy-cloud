@@ -265,7 +265,7 @@ def snapshot_videos(http, video_ids):
                 "video_id": item["id"],
                 "title": snip.get("title", ""),
                 "description": snip.get("description", "") or "",
-                "tags": snip.get("tags"),
+                "tags": json.dumps(snip.get("tags")) if snip.get("tags") else None,
                 "category_id": snip.get("categoryId"),
                 "published_at": int(calendar.timegm(time.strptime(pub.replace("Z", "").replace("z", ""), "%Y-%m-%dT%H:%M:%S"))) if pub else None,
                 "duration_seconds": _parse_duration(cd.get("duration")),
