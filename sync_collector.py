@@ -53,6 +53,7 @@ MAX_PLAYLIST_PAGES = 2
 
 # Cloud-focus mode: when snapshot_targets.json lists keywords, ONLY videos whose
 # title matches are snapshotted (newest-first, capped). No keywords = fully idle.
+# The JSON "cap" wins; env FOCUS_CAP is the fallback for old payloads. 0 = no cap.
 FOCUS_CAP = int(os.getenv("FOCUS_CAP", "41600"))
 SNAPSHOT_TARGETS_PATH = Path(os.getenv("SNAPSHOT_TARGETS_PATH", "snapshot_targets.json"))
 
@@ -67,17 +68,22 @@ def escape_like(pattern: str) -> str:
     )
 
 
-def load_focus() -> list[str]:
-    """Keywords from snapshot_targets.json (app-uploaded). Tolerant: missing,
-    empty or malformed files mean idle mode (empty list)."""
+def load_focus() -> tuple[list[str], int]:
+    """(Keywords, cap) from snapshot_targets.json (app-uploaded).
+
+    Tolerant: missing/empty/malformed files mean idle mode (empty keywords).
+    Cap: JSON value when a non-negative int, else env FOCUS_CAP, else 41600.
+    0 means no cap (snapshot ALL matches).
+    """
     if not SNAPSHOT_TARGETS_PATH.exists():
-        return []
+        return [], FOCUS_CAP
     try:
         data = json.loads(SNAPSHOT_TARGETS_PATH.read_text("utf-8"))
         keywords = data.get("keywords", [])
+        raw_cap = data.get("cap", FOCUS_CAP)
     except (json.JSONDecodeError, OSError, AttributeError):
         log.warning("snapshot_targets.json unreadable — collector idle")
-        return []
+        return [], FOCUS_CAP
     cleaned: list[str] = []
     for kw in keywords:
         if not isinstance(kw, str):
@@ -85,23 +91,30 @@ def load_focus() -> list[str]:
         word = kw.strip().lower()
         if word and word not in cleaned:
             cleaned.append(word)
-    return cleaned
+    cap = FOCUS_CAP
+    if isinstance(raw_cap, int) and not isinstance(raw_cap, bool) and raw_cap >= 0:
+        cap = raw_cap
+    else:
+        log.warning("snapshot_targets.json cap invalid (%r) — using env default %d", raw_cap, FOCUS_CAP)
+    return cleaned, cap
 
 
-def focus_targets(conn: sqlite3.Connection, keywords: list[str], cap: int = FOCUS_CAP) -> list[str]:
+def focus_targets(conn: sqlite3.Connection, keywords: list[str], cap: int | None = FOCUS_CAP) -> list[str]:
     """Video IDs whose title matches any keyword (case-insensitive, LIKE-escaped).
 
-    Deduped across keywords, newest-first (NULL published_at last), capped at
-    `cap` so one run never exceeds the daily quota.
+    Deduped across keywords, newest-first (NULL published_at last). A positive
+    `cap` limits the run so quota stays bounded; None/0 means no limit.
     """
     if not keywords:
         return []
     where = " OR ".join(["lower(title) LIKE ? ESCAPE '\\'"] * len(keywords))
     patterns = [f"%{escape_like(k)}%" for k in keywords]
+    limit = "" if cap is None or cap <= 0 else " LIMIT ?"
+    params = (*patterns, cap) if limit else tuple(patterns)
     rows = conn.execute(
         f"SELECT DISTINCT video_id FROM cloud_videos WHERE {where}"
-        " ORDER BY published_at IS NULL, published_at DESC LIMIT ?",
-        (*patterns, cap),
+        " ORDER BY published_at IS NULL, published_at DESC" + limit,
+        params,
     ).fetchall()
     return [r[0] for r in rows]
 
@@ -360,7 +373,7 @@ def main():
         log.info("Loaded %d tracked channels", len(channels))
 
         # 2. Cloud-focus mode?
-        keywords = load_focus()
+        keywords, focus_cap = load_focus()
         now_ts = int(time.time())
         discovered_pairs = []  # list of (video_id, channel_id)
         snapshots = []
@@ -369,7 +382,7 @@ def main():
             # Idle mode: no keywords configured — zero YouTube calls this run.
             log.info("No cloud-focus keywords — collector idle (schema + sidecar merges only)")
         else:
-            log.info("Cloud focus active: %s", keywords)
+            log.info("Cloud focus active: %s (cap %s)", keywords, focus_cap or "unlimited")
 
             # 3a. RSS discovery only (free, 0 quota) — catches newest uploads so a
             #     later keyword match can include them. Playlist walk is skipped:
@@ -395,8 +408,8 @@ def main():
                 log.info("Inserted %d new video records (RSS discovery)", len(discovered_pairs))
 
             # 4. Snapshot ONLY focus-matched videos (newest-first, capped)
-            target_ids = focus_targets(conn, keywords)
-            log.info("Focus matched %d videos (cap %d) — snapshotting", len(target_ids), FOCUS_CAP)
+            target_ids = focus_targets(conn, keywords, focus_cap)
+            log.info("Focus matched %d videos (cap %s) — snapshotting", len(target_ids), focus_cap or "unlimited")
             snapshots = snapshot_videos(http, target_ids)
             log.info("Got %d snapshot records", len(snapshots))
 
