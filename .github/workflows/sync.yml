@@ -1,4 +1,4 @@
-name: Sync YouTube Stats (R2)
+﻿name: Sync YouTube Stats (R2)
 
 on:
   schedule:
@@ -30,7 +30,7 @@ jobs:
           if aws s3 ls "s3://${AWS_BUCKET}/cloud.db" --endpoint-url "${AWS_ENDPOINT_URL}" >/dev/null 2>&1; then
             aws s3 cp "s3://${AWS_BUCKET}/cloud.db" ./cloud.db --endpoint-url "${AWS_ENDPOINT_URL}"
           else
-            echo "No cloud.db yet — starting fresh"
+            echo "No cloud.db yet â€” starting fresh"
           fi
 
       - name: Download app sidecars (may not exist yet)
@@ -42,6 +42,7 @@ jobs:
         run: |
           aws s3 cp "s3://${AWS_BUCKET}/channels.json" ./channels.json --endpoint-url "${AWS_ENDPOINT_URL}" || true
           aws s3 cp "s3://${AWS_BUCKET}/catalog.json" ./catalog.json --endpoint-url "${AWS_ENDPOINT_URL}" || true
+          aws s3 cp "s3://${AWS_BUCKET}/snapshot_targets.json" ./snapshot_targets.json --endpoint-url "${AWS_ENDPOINT_URL}" || true
 
       - name: Run collector
         run: python sync_collector.py

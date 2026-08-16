@@ -3,11 +3,15 @@
 Run via GitHub Actions every 2 hours:
   1. Apply schema to the downloaded cloud.db (sqlite file, stdlib driver)
   2. Merge app sidecars (channels.json, catalog.json) — INSERT OR IGNORE
-  3. Walk each channel's uploads playlist (newest only, stop at known)
-  4. Supplement with RSS (catches API gaps)
-  5. Snapshot all known videos' stats (videos.list, batched 50)
+  3. Cloud-focus mode: snapshot ONLY videos whose title matches a keyword from
+     snapshot_targets.json (app-uploaded, newest-first, capped at FOCUS_CAP)
+  4. RSS discovery (free) supplements known videos in focus mode
+  5. Snapshot matched videos' stats (videos.list, batched 50)
   6. Compact old snapshots (14-day tiered retention)
   7. Update last_sync
+
+With NO keywords (or a missing/empty snapshot_targets.json) the collector is
+fully idle: schema + sidecar merges only, zero YouTube calls.
 
 The workflow uploads the file back to R2 atomically (temp key + copy).
 """
@@ -46,6 +50,60 @@ RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 
 # Walk at most 2 pages (50 each) per channel per run — catches ~100 latest uploads
 MAX_PLAYLIST_PAGES = 2
+
+# Cloud-focus mode: when snapshot_targets.json lists keywords, ONLY videos whose
+# title matches are snapshotted (newest-first, capped). No keywords = fully idle.
+FOCUS_CAP = int(os.getenv("FOCUS_CAP", "41600"))
+SNAPSHOT_TARGETS_PATH = Path(os.getenv("SNAPSHOT_TARGETS_PATH", "snapshot_targets.json"))
+
+
+# ── Cloud focus (keyword-driven targets) ─────────────────────────────
+def escape_like(pattern: str) -> str:
+    """Escape LIKE wildcards so a keyword matches literally, not as a pattern."""
+    return (
+        pattern.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
+def load_focus() -> list[str]:
+    """Keywords from snapshot_targets.json (app-uploaded). Tolerant: missing,
+    empty or malformed files mean idle mode (empty list)."""
+    if not SNAPSHOT_TARGETS_PATH.exists():
+        return []
+    try:
+        data = json.loads(SNAPSHOT_TARGETS_PATH.read_text("utf-8"))
+        keywords = data.get("keywords", [])
+    except (json.JSONDecodeError, OSError, AttributeError):
+        log.warning("snapshot_targets.json unreadable — collector idle")
+        return []
+    cleaned: list[str] = []
+    for kw in keywords:
+        if not isinstance(kw, str):
+            continue
+        word = kw.strip().lower()
+        if word and word not in cleaned:
+            cleaned.append(word)
+    return cleaned
+
+
+def focus_targets(conn: sqlite3.Connection, keywords: list[str], cap: int = FOCUS_CAP) -> list[str]:
+    """Video IDs whose title matches any keyword (case-insensitive, LIKE-escaped).
+
+    Deduped across keywords, newest-first (NULL published_at last), capped at
+    `cap` so one run never exceeds the daily quota.
+    """
+    if not keywords:
+        return []
+    where = " OR ".join(["lower(title) LIKE ? ESCAPE '\\'"] * len(keywords))
+    patterns = [f"%{escape_like(k)}%" for k in keywords]
+    rows = conn.execute(
+        f"SELECT DISTINCT video_id FROM cloud_videos WHERE {where}"
+        " ORDER BY published_at IS NULL, published_at DESC LIMIT ?",
+        (*patterns, cap),
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 # ── SQLite ────────────────────────────────────────────────────────────
@@ -301,82 +359,46 @@ def main():
         ]
         log.info("Loaded %d tracked channels", len(channels))
 
-        # 2. Load known video IDs (for stop-at-known during discovery)
-        known_ids = {r[0] for r in conn.execute("SELECT video_id FROM cloud_videos")}
-        log.info("Known video IDs: %d", len(known_ids))
-
-        # 3. Discover new uploads per channel — track (video_id, channel_id) pairs
-        discovered_pairs = []  # list of (video_id, channel_id)
-        for ch in channels:
-            cid = ch["channel_id"]
-            up = ch.get("uploads_playlist_id")
-            if not up:
-                log.info("  %s: no uploads_playlist_id, skipping", cid)
-                continue
-
-            new_ids = discover_uploads(http, cid, up, known_ids)
-            if new_ids:
-                log.info("  %s: API returned %d new uploads", cid, len(new_ids))
-                for vid in new_ids:
-                    discovered_pairs.append((vid, cid))
-
-            # RSS supplement (catches videos the API playlist misses)
-            rss_ids = discover_rss(http, cid)
-            rss_extra = [v for v in rss_ids if v not in known_ids and v not in new_ids]
-            if rss_extra:
-                log.info("  %s: RSS supplied %d extra", cid, len(rss_extra))
-                for vid in rss_extra:
-                    discovered_pairs.append((vid, cid))
-
-        # 4. Insert new videos (batched)
+        # 2. Cloud-focus mode?
+        keywords = load_focus()
         now_ts = int(time.time())
-        if discovered_pairs:
-            conn.executemany(
-                "INSERT OR IGNORE INTO cloud_videos (video_id, channel_id, first_seen_at)"
-                " VALUES (?, ?, ?)",
-                [(vid, cid, now_ts) for vid, cid in discovered_pairs],
-            )
-            conn.commit()
-            log.info("Inserted %d new video records", len(discovered_pairs))
+        discovered_pairs = []  # list of (video_id, channel_id)
+        snapshots = []
 
-        # 4b. Load published_at for newly discovered videos from playlistItems
-        if discovered_pairs:
-            for i in range(0, len(discovered_pairs), 50):
-                batch = [v for v, _ in discovered_pairs[i:i+50]]
-                resp = _request_with_retries(
-                    http, "GET", "https://www.googleapis.com/youtube/v3/videos",
-                    params={
-                        "part": "snippet",
-                        "id": ",".join(batch),
-                        "key": YOUTUBE_KEY,
-                        "fields": "items(id,snippet(publishedAt))",
-                        "maxResults": 50,
-                    },
+        if not keywords:
+            # Idle mode: no keywords configured — zero YouTube calls this run.
+            log.info("No cloud-focus keywords — collector idle (schema + sidecar merges only)")
+        else:
+            log.info("Cloud focus active: %s", keywords)
+
+            # 3a. RSS discovery only (free, 0 quota) — catches newest uploads so a
+            #     later keyword match can include them. Playlist walk is skipped:
+            #     its quota cost is exactly what focus mode exists to avoid.
+            known_ids = {r[0] for r in conn.execute("SELECT video_id FROM cloud_videos")}
+            log.info("Known video IDs: %d", len(known_ids))
+            for ch in channels:
+                rss_ids = discover_rss(http, ch["channel_id"])
+                rss_extra = [v for v in rss_ids if v not in known_ids]
+                if rss_extra:
+                    log.info("  %s: RSS supplied %d extra", ch["channel_id"], len(rss_extra))
+                    for vid in rss_extra:
+                        discovered_pairs.append((vid, ch["channel_id"]))
+
+            # 3b. Insert new videos (batched)
+            if discovered_pairs:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO cloud_videos (video_id, channel_id, first_seen_at)"
+                    " VALUES (?, ?, ?)",
+                    [(vid, cid, now_ts) for vid, cid in discovered_pairs],
                 )
-                if resp.status_code != 200:
-                    continue
-                pub_stmts = []
-                for item in resp.json().get("items", []):
-                    pub = item.get("snippet", {}).get("publishedAt")
-                    if pub:
-                        pub_ts = int(calendar.timegm(time.strptime(pub.replace("Z", "").replace("z", ""), "%Y-%m-%dT%H:%M:%S")))
-                        pub_stmts.append(
-                            (pub_ts, item["id"])
-                        )
-                if pub_stmts:
-                    conn.executemany(
-                        "UPDATE cloud_videos SET published_at = ?"
-                        " WHERE video_id = ? AND published_at IS NULL",
-                        pub_stmts,
-                    )
-                    conn.commit()
+                conn.commit()
+                log.info("Inserted %d new video records (RSS discovery)", len(discovered_pairs))
 
-        # 5. Snapshot all known videos
-        all_video_ids = [r[0] for r in conn.execute("SELECT video_id FROM cloud_videos")]
-        log.info("Snapshotting %d videos", len(all_video_ids))
-
-        snapshots = snapshot_videos(http, all_video_ids)
-        log.info("Got %d snapshot records", len(snapshots))
+            # 4. Snapshot ONLY focus-matched videos (newest-first, capped)
+            target_ids = focus_targets(conn, keywords)
+            log.info("Focus matched %d videos (cap %d) — snapshotting", len(target_ids), FOCUS_CAP)
+            snapshots = snapshot_videos(http, target_ids)
+            log.info("Got %d snapshot records", len(snapshots))
 
         # 5b. Update video metadata from snapshot response (batched)
         meta_stmts = [
