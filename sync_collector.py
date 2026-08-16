@@ -2,7 +2,8 @@
 
 Run via GitHub Actions every 2 hours:
   1. Apply schema to the downloaded cloud.db (sqlite file, stdlib driver)
-  2. Merge app sidecars (channels.json, catalog.json) — INSERT OR IGNORE
+  2. Merge app sidecars (channels.json, catalog.json) — INSERT, with a
+     title-NULL-only backfill UPSERT so RSS-discovered rows gain titles
   3. Cloud-focus mode: snapshot ONLY videos whose title matches a keyword from
      snapshot_targets.json (app-uploaded, newest-first, capped at FOCUS_CAP)
   4. RSS discovery (free) supplements known videos in focus mode
@@ -179,10 +180,23 @@ def _merge_sidecars(conn: sqlite3.Connection) -> dict:
                     # like_count, comment_count
                     snap_rows.append(tuple(s))
             if video_rows:
+                # UPSERT: backfill metadata ONLY on rows whose title is NULL
+                # (RSS-discovered rows carry no title, so they could never match
+                # focus keywords otherwise). Rows with a title are left untouched
+                # (no rewrite churn); first_seen_at is preserved on conflict.
                 conn.executemany(
-                    "INSERT OR IGNORE INTO cloud_videos (video_id, channel_id, title,"
+                    "INSERT INTO cloud_videos (video_id, channel_id, title,"
                     " description, tags, category_id, published_at, duration_seconds,"
-                    " thumbnail_url, first_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " thumbnail_url, first_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(video_id) DO UPDATE SET"
+                    " title = excluded.title,"
+                    " description = excluded.description,"
+                    " tags = excluded.tags,"
+                    " category_id = excluded.category_id,"
+                    " published_at = excluded.published_at,"
+                    " duration_seconds = excluded.duration_seconds,"
+                    " thumbnail_url = excluded.thumbnail_url"
+                    " WHERE cloud_videos.title IS NULL",
                     video_rows,
                 )
                 counts["videos"] = len(video_rows)
