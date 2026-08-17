@@ -297,21 +297,35 @@ def discover_uploads(http, channel_id, uploads_playlist_id, known_ids):
 
 
 def discover_rss(http, channel_id):
-    """Fallback RSS discovery (0 quota, latest ~15)."""
+    """Fallback RSS discovery (0 quota, latest ~15).
+
+    Returns list of dicts: {video_id, title, published_at}. Titles come
+    straight from the feed so focus keywords can match brand-new uploads
+    immediately — a title-less row can never match a keyword, and nothing
+    backfills it while the app is closed (catalog.json only covers newly
+    added channels)."""
     try:
         resp = _request_with_retries(http, "GET", RSS_URL.format(channel_id=channel_id), follow_redirects=True)
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
-        ids = []
+        out = []
         for entry in feed.entries:
             vid = entry.get("yt_videoid")
             if not vid:
                 link = entry.get("link", "")
                 if "watch?v=" in link:
                     vid = link.split("watch?v=", 1)[1].split("&", 1)[0]
-            if vid:
-                ids.append(vid)
-        return ids
+            if not vid:
+                continue
+            published_at = None
+            if entry.get("published_parsed"):
+                published_at = calendar.timegm(entry.published_parsed)
+            out.append({
+                "video_id": vid,
+                "title": entry.get("title"),
+                "published_at": published_at,
+            })
+        return out
     except Exception:
         log.warning("  %s: RSS fetch failed", channel_id, exc_info=True)
         return []
@@ -389,7 +403,7 @@ def main():
         # 2. Cloud-focus mode?
         keywords, focus_cap = load_focus()
         now_ts = int(time.time())
-        discovered_pairs = []  # list of (video_id, channel_id)
+        discovered_pairs = []  # list of (video_id, channel_id, title, published_at)
         snapshots = []
 
         if not keywords:
@@ -401,25 +415,32 @@ def main():
             # 3a. RSS discovery only (free, 0 quota) — catches newest uploads so a
             #     later keyword match can include them. Playlist walk is skipped:
             #     its quota cost is exactly what focus mode exists to avoid.
-            known_ids = {r[0] for r in conn.execute("SELECT video_id FROM cloud_videos")}
-            log.info("Known video IDs: %d", len(known_ids))
+            #     Feed entries carry titles + published_at, so every upsert below
+            #     backfills title-less rows (previous RSS inserts) in the same pass.
             for ch in channels:
-                rss_ids = discover_rss(http, ch["channel_id"])
-                rss_extra = [v for v in rss_ids if v not in known_ids]
-                if rss_extra:
-                    log.info("  %s: RSS supplied %d extra", ch["channel_id"], len(rss_extra))
-                    for vid in rss_extra:
-                        discovered_pairs.append((vid, ch["channel_id"]))
+                refs = discover_rss(http, ch["channel_id"])
+                for ref in refs:
+                    discovered_pairs.append(
+                        (ref["video_id"], ch["channel_id"], ref["title"], ref["published_at"])
+                    )
+            log.info("RSS discovery returned %d feed entries", len(discovered_pairs))
 
-            # 3b. Insert new videos (batched)
+            # 3b. Upsert RSS-discovered videos (batched). Backfills titles ONLY on
+            #     rows whose title is NULL (same pattern as the catalog merge), so
+            #     orphaned title-less rows from earlier runs get fixed here; rows
+            #     that already carry metadata are left untouched.
             if discovered_pairs:
                 conn.executemany(
-                    "INSERT OR IGNORE INTO cloud_videos (video_id, channel_id, first_seen_at)"
-                    " VALUES (?, ?, ?)",
-                    [(vid, cid, now_ts) for vid, cid in discovered_pairs],
+                    "INSERT INTO cloud_videos (video_id, channel_id, title,"
+                    " published_at, first_seen_at) VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT(video_id) DO UPDATE SET"
+                    " title = excluded.title,"
+                    " published_at = COALESCE(excluded.published_at, cloud_videos.published_at)"
+                    " WHERE cloud_videos.title IS NULL",
+                    [(vid, cid, title, published_at, now_ts) for vid, cid, title, published_at in discovered_pairs],
                 )
                 conn.commit()
-                log.info("Inserted %d new video records (RSS discovery)", len(discovered_pairs))
+                log.info("Upserted %d RSS-discovered video records (titles backfilled)", len(discovered_pairs))
 
             # 4. Snapshot ONLY focus-matched videos (newest-first, capped)
             target_ids = focus_targets(conn, keywords, focus_cap)
@@ -500,7 +521,7 @@ def main():
 
         elapsed = time.perf_counter() - _t0
         log.info(
-            "Collector done in %.2fs — %d new videos, %d snapshots (merged: %d channels, %d videos, %d snapshots)",
+            "Collector done in %.2fs — %d RSS entries upserted, %d snapshots (merged: %d channels, %d videos, %d snapshots)",
             elapsed, len(discovered_pairs), len(snapshots),
             merged["channels"], merged["videos"], merged["snapshots"],
         )
