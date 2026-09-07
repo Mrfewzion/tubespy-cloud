@@ -1,4 +1,4 @@
-﻿name: Sync YouTube Stats (R2)
+name: Sync YouTube Stats (R2)
 
 # Heartbeat every 30 min instead of a bare 2h cron: GitHub's scheduler delays
 # and silently skips scheduled runs under load (observed 6h gaps), so 48 cheap
