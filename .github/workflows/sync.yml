@@ -1,13 +1,20 @@
 name: Sync YouTube Stats (R2)
 
-# Heartbeat every 30 min instead of a bare 2h cron: GitHub's scheduler delays
-# and silently skips scheduled runs under load (observed 6h gaps), so 48 cheap
-# checks/day self-heal a skipped slot at the next tick. The freshness guard
-# below keeps the REAL collection cadence at ~2h - YouTube quota and R2 write
-# volume are unchanged.
+# Schedule: every 2 hours, deliberately.
+#
+# Measured delivery for this repo over 400 real runs (Aug-Oct 2026):
+#   cron '0 */2 * * *' (12/day) -> 12.9/day delivered = 107%   (Aug 4-16)
+#   cron '*/30 * * * *' (48/day) ->  6.0/day delivered =  13%   (Sep 8-Oct 3)
+#
+# GitHub's scheduler silently DROPS sub-hourly crons here - 1084 of 1238
+# requested half-hourly slots produced no run record at all - which made the
+# effective data cadence ~4h (median gap 239 min, max 509 min) instead of the
+# ~2h the 2-hourly cron actually delivers. Do not "improve" this to a heartbeat
+# or a finer interval: it makes freshness strictly worse. See the Cloud sync
+# entry in TubeSpy's OpenCodeLog.md for the full measurement.
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '0 */2 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -18,45 +25,14 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      # Fail-open guard: any error here proceeds to collect, never blocks.
-      # Manual dispatches bypass it (force-refresh always works).
-      - name: Freshness guard (skip heartbeat if cloud.db < 100 min old)
-        if: github.event_name == 'schedule'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          AWS_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: |
-          HEAD=$(aws s3api head-object --bucket "${AWS_BUCKET}" --key cloud.db --endpoint-url "${AWS_ENDPOINT_URL}" 2>/dev/null || true)
-          LAST=$(printf '%s' "$HEAD" | python3 -c "import sys,json,datetime
-          try:
-              d = json.load(sys.stdin)
-              print(int(datetime.datetime.fromisoformat(d['LastModified'].replace('Z', '+00:00')).timestamp()))
-          except Exception:
-              print('')")
-          NOW=$(date +%s)
-          if [ -n "$LAST" ] && [ $(( NOW - LAST )) -lt 6000 ]; then
-            echo "cloud.db is $(( (NOW - LAST) / 60 )) min old (<100) - no-op heartbeat"
-            echo "SKIP=true" >> "$GITHUB_ENV"
-          else
-            echo "cloud.db age=${LAST:+$(( (NOW - LAST) / 60 )) min}${LAST:-missing (first run)} - collecting"
-            echo "SKIP=false" >> "$GITHUB_ENV"
-          fi
-          exit 0
-
       - uses: actions/checkout@v5
-        if: env.SKIP != 'true'
       - uses: actions/setup-python@v5
-        if: env.SKIP != 'true'
         with:
           python-version: '3.13'
       - name: Install dependencies
-        if: env.SKIP != 'true'
         run: pip install -r requirements.txt
 
       - name: Download cloud.db (abort if download fails)
-        if: env.SKIP != 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -70,7 +46,6 @@ jobs:
           fi
 
       - name: Download app sidecars (may not exist yet)
-        if: env.SKIP != 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -82,7 +57,6 @@ jobs:
           aws s3 cp "s3://${AWS_BUCKET}/snapshot_targets.json" ./snapshot_targets.json --endpoint-url "${AWS_ENDPOINT_URL}" || true
 
       - name: Run collector
-        if: env.SKIP != 'true'
         run: python sync_collector.py
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
@@ -91,12 +65,10 @@ jobs:
           HTTP_BACKOFF_BASE: '1'
 
       - name: Verify integrity before upload
-        if: env.SKIP != 'true'
         run: |
           python -c "import sqlite3; c=sqlite3.connect('cloud.db'); assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok', 'integrity check failed'"
 
       - name: Upload cloud.db (atomic temp key + copy)
-        if: env.SKIP != 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

@@ -122,8 +122,21 @@ def focus_targets(conn: sqlite3.Connection, keywords: list[str], cap: int | None
 
 # ── SQLite ────────────────────────────────────────────────────────────
 def _connect(db_path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    # Same PRAGMA set as the app (Build Spec §4). Python's implicit 5 s
+    # busy_timeout and synchronous=FULL both bite here: this is a long-running
+    # writer over a WAL database that can overlap the app's read of an uploaded
+    # copy, and without a busy_timeout that surfaces as "database is locked"
+    # instead of waiting.
+    #
+    # These two PRAGMAs were lost in 0b5cfda (2026-08-15, Turso -> R2) and went
+    # unnoticed for a month because TubeSpy's test for this invariant read a
+    # stale in-repo COPY of this file rather than the file that actually runs.
+    # Do not remove them; tests/test_cloud_sync.py
+    # ::test_the_cloud_collector_writer_uses_the_app_pragma_set asserts them.
+    conn = sqlite3.connect(db_path, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
