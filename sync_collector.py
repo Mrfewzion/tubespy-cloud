@@ -137,6 +137,21 @@ def parse_last_modified(raw: str | None) -> float | None:
         return None
 
 
+def _age_minutes(stamp: float | None, now: float | None = None) -> float | None:
+    """Age of cloud.db in MINUTES, or None when the timestamp was unreadable.
+
+    One place converts seconds to minutes. This existed as inline arithmetic in
+    two branches of guard_main and they diverged: the schedule path divided by
+    60 and the dispatch path did not, so the same 8.6 h-old object was logged
+    as "30840 min" on a manual run. The decision was never affected — dispatch
+    does not skip — but a freshness figure that is wrong by 60x gets quoted as
+    fact by the next person to read the log.
+    """
+    if stamp is None:
+        return None
+    return ((time.time() if now is None else now) - stamp) / 60.0
+
+
 def guard_main(
     last_modified: str | None,
     github_env_path: str,
@@ -156,26 +171,22 @@ def guard_main(
     would have meant no manual run could ever verify this code.
     """
     stamp = parse_last_modified(last_modified)
+    age = _age_minutes(stamp, now)
     if event != "schedule":
         # Not a scheduled wake-up: report the age for the log, never skip.
-        age_desc = (
-            "%.0f min" % ((time.time() if now is None else now) - stamp)
-            if stamp is not None else "unknown"
-        )
         log.info(
             "Freshness guard: %s event, cloud.db age %s -> always collect",
-            event, age_desc,
+            event, "unknown" if age is None else "%.0f min" % age,
         )
         skip = False
-    elif stamp is None:
+    elif age is None:
         log.info("Freshness guard: cloud.db age unknown -> collecting")
         skip = False
     else:
-        age = (time.time() if now is None else now) - stamp
-        skip = not should_collect(age)
+        skip = not should_collect(age * 60.0)
         log.info(
             "Freshness guard: cloud.db is %.0f min old (threshold %d min) -> %s",
-            age / 60,
+            age,
             FRESHNESS_GUARD_SECONDS // 60,
             "skip" if skip else "collect",
         )
