@@ -18,6 +18,7 @@ The workflow uploads the file back to R2 atomically (temp key + copy).
 """
 
 import calendar
+import datetime as dt
 import json
 import os
 import re
@@ -57,6 +58,105 @@ MAX_PLAYLIST_PAGES = 2
 # The JSON "cap" wins; env FOCUS_CAP is the fallback for old payloads. 0 = no cap.
 FOCUS_CAP = int(os.getenv("FOCUS_CAP", "41600"))
 SNAPSHOT_TARGETS_PATH = Path(os.getenv("SNAPSHOT_TARGETS_PATH", "snapshot_targets.json"))
+
+
+# ── Freshness guard (workflow `schedule` events only) ─────────────────
+#
+# The workflow asks GitHub for a wake-up far more often than a collection is
+# actually due, and this decides whether a given wake-up is due. Asking often is
+# only affordable because a too-soon wake-up costs one HEAD request instead of a
+# ~50 MB download, a YouTube quota spend, and an upload.
+#
+# The asymmetry IS the contract: skip only on positive proof that cloud.db is
+# already fresh. A missing object, a permissions error, or unparseable output all
+# collect, because the cost of a needless collection is quota we can afford and
+# the cost of a wrongly skipped one is silently stale data nobody can see.
+#
+# The decision lives here, not in the workflow YAML, so it is unit-testable.
+# The previous version put it in shell (`${LAST:+...}`), where the one bug it
+# ever had — printing the raw epoch glued onto the age, "age=288 min1791020025"
+# — could only ever be checked by simulating it by hand. See OpenCodeLog #129
+# and #270.
+
+FRESHNESS_GUARD_SECONDS = int(os.getenv("FRESHNESS_GUARD_SECONDS", "7200"))
+
+
+def should_collect(age_seconds: float | None, threshold: int | None = None) -> bool:
+    """Whether a wake-up should do a full collection.
+
+    `age_seconds` is how old cloud.db is, or None when that could not be
+    determined. None always collects — fail open, never on absence of evidence.
+
+    A NEGATIVE age is treated as unknown for the same reason: it means the
+    runner's clock is behind the object's LastModified, which is not evidence
+    that the data is fresh. Only a positive, readable age can justify a skip.
+    """
+    if age_seconds is None:
+        return True
+    limit = FRESHNESS_GUARD_SECONDS if threshold is None else threshold
+    try:
+        age = float(age_seconds)
+    except (TypeError, ValueError):
+        return True
+    if age < 0:
+        return True
+    return age >= limit
+
+
+def parse_last_modified(raw: str | None) -> float | None:
+    """Epoch seconds from `aws s3api head-object --output text`, else None.
+
+    Tolerant by necessity: a missing key, a denied request, or a failed step all
+    arrive here as empty or garbage text, and "None" is a real observed stdout.
+    Every unparseable form must map to None so the caller fails open.
+    """
+    if raw is None:
+        return None
+    text = raw.strip().strip("'\"")
+    if not text or text.lower() in ("none", "null", "-"):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def guard_main(
+    last_modified: str | None,
+    github_env_path: str,
+    now: float | None = None,
+) -> int:
+    """Decide, append SKIP to $GITHUB_ENV, and always return 0.
+
+    Returning 0 unconditionally is deliberate: the guard must never be the
+    reason a run goes red. Writing the flag matters just as much — every
+    downstream step is gated on `env.SKIP != 'true'`, so failing to write it
+    silently turns the guard into a no-op that still reads as protection.
+    """
+    stamp = parse_last_modified(last_modified)
+    if stamp is None:
+        log.info("Freshness guard: cloud.db age unknown -> collecting")
+        skip = False
+    else:
+        age = (time.time() if now is None else now) - stamp
+        skip = not should_collect(age)
+        log.info(
+            "Freshness guard: cloud.db is %.0f min old (threshold %d min) -> %s",
+            age / 60,
+            FRESHNESS_GUARD_SECONDS // 60,
+            "skip" if skip else "collect",
+        )
+    try:
+        with open(github_env_path, "a", encoding="utf-8") as fh:
+            fh.write(f"SKIP={'true' if skip else 'false'}\n")
+    except OSError:
+        # Unset SKIP satisfies `env.SKIP != 'true'`, so the steps still collect.
+        log.warning("Freshness guard: could not write %s", github_env_path, exc_info=True)
+    return 0
 
 
 # ── Cloud focus (keyword-driven targets) ─────────────────────────────

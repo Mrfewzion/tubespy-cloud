@@ -1,20 +1,42 @@
 name: Sync YouTube Stats (R2)
 
-# Schedule: every 2 hours, deliberately.
+# Schedule: every 30 min, deliberately, WITH a freshness guard.
 #
-# Measured delivery for this repo over 400 real runs (Aug-Oct 2026):
-#   cron '0 */2 * * *' (12/day) -> 12.9/day delivered = 107%   (Aug 4-16)
-#   cron '*/30 * * * *' (48/day) ->  6.0/day delivered =  13%   (Sep 8-Oct 3)
+# Measured delivery for this repo over all 394 scheduled runs (Aug 11 - Oct 4
+# 2026). The break is the DATE, not the cron:
 #
-# GitHub's scheduler silently DROPS sub-hourly crons here - 1084 of 1238
-# requested half-hourly slots produced no run record at all - which made the
-# effective data cadence ~4h (median gap 239 min, max 509 min) instead of the
-# ~2h the 2-hourly cron actually delivers. Do not "improve" this to a heartbeat
-# or a finer interval: it makes freshness strictly worse. See the Cloud sync
-# entry in TubeSpy's OpenCodeLog.md for the full measurement.
+#   Aug 12 - Aug 26   cron '0 */2 * * *'  -> 11.87/day delivered (98.9%)
+#   Aug 27 - Sep  7   cron '0 */2 * * *'  ->  4.95/day delivered (41.2%)   <-- CLIFF
+#   Sep  7 - Oct  3   cron '*/30 * * * *' ->  5.96/day delivered
+#
+# The cron was IDENTICAL either side of the cliff, so the expression cannot be
+# the cause: GitHub's Actions cron scheduler degraded for this repo on
+# 2026-08-26/27 and delivers a fraction of whatever is requested. Two more
+# measurements pin it down:
+#
+#   * created_at == started_at on 400/400 runs, max queue delay 0 s. The runs
+#     are not waiting in a runner queue; the scheduler is failing to CREATE
+#     them. Moving off the top of the hour cannot help.
+#   * The offset from the requested slot changed shape. Healthy: peaked at
+#     10-29 min and decayed (a queue delay). Degraded: flat across the whole
+#     120-min window - a random time, not a late one.
+#
+# An earlier note here said GitHub "silently DROPS sub-hourly crons for this
+# repo". That was wrong, and it ruled out the fix. The natural experiment on
+# Sep 7 settles it: the 10 days before that change asked for 12 slots/day and
+# delivered 5.30/day; the 10 days after asked for 48 and delivered 6.50/day.
+# Asking for MORE slots delivered MORE runs. See OpenCodeLog.md #270, which
+# retracts #269.
+#
+# So: ask often (a missed slot is cheap to recover from, because the next
+# wake-up is minutes away rather than 2 h away) and let the guard decide which
+# wake-ups are actually due. That is the only lever left while GitHub's
+# scheduler is degraded. Expected result is ~6.5 collections/day vs ~4.1 now -
+# a real gain, NOT the 12/day the cron requests. Do not read the cron as a
+# contract; read OpenCodeLog #270 for the measured delivery rate.
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -32,7 +54,30 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Runs on schedule events ONLY. workflow_dispatch must always force a
+      # full collection, or a manual refresh could never overwrite fresher data.
+      - name: Freshness guard
+        if: github.event_name == 'schedule'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          LAST=$(aws s3api head-object \
+                   --bucket "${AWS_BUCKET}" --key cloud.db \
+                   --endpoint-url "${AWS_ENDPOINT_URL}" \
+                   --query LastModified --output text 2>/dev/null || true)
+          CLOUD_DB_LASTMODIFIED="$LAST" python -c "
+          import os, sys
+          sys.path.insert(0, '.')
+          from sync_collector import guard_main
+          raise SystemExit(guard_main(
+              os.environ.get('CLOUD_DB_LASTMODIFIED'), os.environ['GITHUB_ENV']))
+          "
+
       - name: Download cloud.db (abort if download fails)
+        if: env.SKIP != 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -46,6 +91,7 @@ jobs:
           fi
 
       - name: Download app sidecars (may not exist yet)
+        if: env.SKIP != 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -57,6 +103,7 @@ jobs:
           aws s3 cp "s3://${AWS_BUCKET}/snapshot_targets.json" ./snapshot_targets.json --endpoint-url "${AWS_ENDPOINT_URL}" || true
 
       - name: Run collector
+        if: env.SKIP != 'true'
         run: python sync_collector.py
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
@@ -65,10 +112,12 @@ jobs:
           HTTP_BACKOFF_BASE: '1'
 
       - name: Verify integrity before upload
+        if: env.SKIP != 'true'
         run: |
           python -c "import sqlite3; c=sqlite3.connect('cloud.db'); assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok', 'integrity check failed'"
 
       - name: Upload cloud.db (atomic temp key + copy)
+        if: env.SKIP != 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
