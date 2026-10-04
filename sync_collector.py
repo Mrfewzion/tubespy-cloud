@@ -38,7 +38,19 @@ logging.basicConfig(
 log = logging.getLogger("sync")
 
 # ── Config from environment ──────────────────────────────────────────
-YOUTUBE_KEY = os.environ["YOUTUBE_API_KEY"]
+#
+# Read with .get(), NEVER os.environ[...]. A module-level subscript makes the
+# whole module un-importable without a full set of credentials, and that is not a
+# theoretical concern: the workflow's freshness-guard step imports this module
+# for `guard_main` and deliberately carries no YouTube key, so run 37203657581
+# (2026-10-04) died in 15 s with `KeyError: 'YOUTUBE_API_KEY'` raised at import.
+# Requiring a credential to *import* also makes the module unusable from any tool,
+# test or future step that is not a full collection.
+#
+# The key is validated where it is actually used — see _require_youtube_key() —
+# so a missing key is still a loud, immediate failure rather than an opaque 403
+# from the Data API partway through a run.
+YOUTUBE_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 CLOUD_DB_PATH = Path(os.getenv("CLOUD_DB_PATH", "cloud.db"))
 SCHEMA_PATH = Path(os.getenv("SCHEMA_PATH", str(Path(__file__).parent / "schema.sql")))
 
@@ -129,6 +141,7 @@ def guard_main(
     last_modified: str | None,
     github_env_path: str,
     now: float | None = None,
+    event: str = "schedule",
 ) -> int:
     """Decide, append SKIP to $GITHUB_ENV, and always return 0.
 
@@ -136,9 +149,25 @@ def guard_main(
     reason a run goes red. Writing the flag matters just as much — every
     downstream step is gated on `env.SKIP != 'true'`, so failing to write it
     silently turns the guard into a no-op that still reads as protection.
+
+    `event` makes the DECISION event-aware while the workflow always runs this
+    step. A manual dispatch never skips: it is the only way a user can force a
+    refresh after a bad window, and gating the whole step on the event instead
+    would have meant no manual run could ever verify this code.
     """
     stamp = parse_last_modified(last_modified)
-    if stamp is None:
+    if event != "schedule":
+        # Not a scheduled wake-up: report the age for the log, never skip.
+        age_desc = (
+            "%.0f min" % ((time.time() if now is None else now) - stamp)
+            if stamp is not None else "unknown"
+        )
+        log.info(
+            "Freshness guard: %s event, cloud.db age %s -> always collect",
+            event, age_desc,
+        )
+        skip = False
+    elif stamp is None:
         log.info("Freshness guard: cloud.db age unknown -> collecting")
         skip = False
     else:
@@ -491,7 +520,25 @@ def snapshot_videos(http, video_ids):
 
 
 # ── Main ──────────────────────────────────────────────────────────────
+def _require_youtube_key() -> None:
+    """Exit non-zero, loudly, if there is no API key.
+
+    The module deliberately reads YOUTUBE_API_KEY with .get() so it can be
+    imported without credentials. That must not turn a missing key into a
+    confusing 403 from the Data API several minutes into a run, so the check
+    happens here instead — at the point of use, before any network call.
+    """
+    if not YOUTUBE_KEY.strip():
+        log.error(
+            "YOUTUBE_API_KEY is not set — cannot collect. Set it in the "
+            "workflow env (it is only present on the 'Run collector' step, "
+            "which is correct: the freshness guard does not need it)."
+        )
+        sys.exit(2)
+
+
 def main():
+    _require_youtube_key()
     _t0 = time.perf_counter()
     log.info("Collector starting (cloud.db=%s)", CLOUD_DB_PATH)
 

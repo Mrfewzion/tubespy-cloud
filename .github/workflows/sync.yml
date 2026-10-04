@@ -54,10 +54,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Runs on schedule events ONLY. workflow_dispatch must always force a
-      # full collection, or a manual refresh could never overwrite fresher data.
+      # Runs on EVERY event, deliberately. It costs one head-object request.
+      #
+      # An earlier version gated this whole step on
+      # `github.event_name == 'schedule'` so workflow_dispatch would force a
+      # collection. That was correct about the DECISION and wrong about the STEP:
+      # it meant no manual run ever executed the guard, so its first shipped
+      # version reached production untested and died in 15 s with a KeyError that
+      # only a scheduled event could hit (run 37203657581). The skip decision is
+      # event-aware now, inside guard_main, so a dispatch always collects AND a
+      # dispatch always verifies this code.
       - name: Freshness guard
-        if: github.event_name == 'schedule'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -73,7 +80,8 @@ jobs:
           sys.path.insert(0, '.')
           from sync_collector import guard_main
           raise SystemExit(guard_main(
-              os.environ.get('CLOUD_DB_LASTMODIFIED'), os.environ['GITHUB_ENV']))
+              os.environ.get('CLOUD_DB_LASTMODIFIED'), os.environ['GITHUB_ENV'],
+              event=os.environ.get('GITHUB_EVENT_NAME', 'schedule')))
           "
 
       - name: Download cloud.db (abort if download fails)
